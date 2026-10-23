@@ -7,9 +7,6 @@ powershell
 python -m venv venv
 .\venv\Scripts\Activate        # Windows PowerShell
 
-# 3. Поставил всё из requirements.txt
-pip install -r requirements.txt
-
-# 4. Настроил .env 
-# 5. Запустил
+# 1. Поставил всё из requirements.txt
+# 2. Запустил
 python main.py
