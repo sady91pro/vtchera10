@@ -2,7 +2,7 @@ from aiogram import Dispatcher
 from aiogram.types import Message, CallbackQuery, InputMediaPhoto
 
 from bot.Services import db
-from bot.Utils.helpers import render_participant, send_results
+from bot.Utils.helpers import render_participant, send_results, photos_of, esc
 from bot.config import ADMIN_IDS, SUPERADMIN_IDS
 
 
@@ -51,6 +51,11 @@ async def cmd_help(message: Message):
             "/votes — кто за кого проголосовал",
             "/unvote &lt;id&gt; — снять голос пользователя",
             "/delparticipant &lt;id&gt; — удалить участника",
+            "/announce — объявить победителей всем",
+            "/schedule_open &lt;YYYY-MM-DD HH:MM&gt; — автооткрытие",
+            "/schedule_close &lt;YYYY-MM-DD HH:MM&gt; — автозакрытие",
+            "/unschedule — отменить расписание",
+            "/shuffle — перемешать порядок участников",
             "/stats — статистика голосования",
             "/export — выгрузить голоса в CSV",
             "/broadcast — рассылка всем проголосовавшим",
@@ -60,8 +65,12 @@ async def cmd_help(message: Message):
                 "",
                 "<b>Только суперадмин:</b>",
                 "/admins — управление админами",
-                "/addadmin &lt;id&gt; — добавить админа",
-                "/deladmin &lt;id&gt; — удалить админа",
+                "/addadmin &lt;id | @username&gt; — добавить админа",
+                "/deladmin &lt;id | @username&gt; — удалить админа",
+                "/promote &lt;id | @username&gt; — сделать суперадмином",
+                "/demote &lt;id | @username&gt; — понизить до админа",
+                "/audit — аудит-лог",
+                "/backup — скачать votes.db",
             ]
     await message.answer("\n".join(lines))
 
@@ -69,7 +78,9 @@ async def cmd_help(message: Message):
 async def cmd_myid(message: Message):
     uid = message.from_user.id
     if uid in SUPERADMIN_IDS or uid in ADMIN_IDS:
-        status = "👑 СУПЕРАДМИН"
+        status = "🛡 СУПЕРАДМИН (.env)"
+    elif await db.is_superadmin(uid):
+        status = "⭐ СУПЕРАДМИН (через бота)"
     elif await db.is_admin(uid):
         status = "✅ АДМИН (через бота)"
     else:
@@ -77,8 +88,7 @@ async def cmd_myid(message: Message):
     await message.answer(
         f"<b>Ваш user_id:</b> <code>{uid}</code>\n"
         f"<b>Username:</b> @{message.from_user.username or '—'}\n"
-        f"<b>Статус:</b> {status}\n"
-        f"<b>Суперадмины:</b> <code>{SUPERADMIN_IDS}</code>"
+        f"<b>Статус:</b> {status}"
     )
 
 
@@ -90,7 +100,7 @@ async def cmd_vote(message: Message):
     prev_pid = await db.get_user_vote(message.from_user.id)
     if prev_pid:
         p = await db.get_participant(prev_pid)
-        name = p[1] if p else "?"
+        name = esc(p[1]) if p else "?"
         await message.answer(
             f"Вы уже голосовали за «{name}».\n"
             f"Можно передумать — выберите другого участника ниже. "
@@ -130,13 +140,22 @@ async def cb_vote(call: CallbackQuery):
             "Вы уже голосуете за этого участника", show_alert=True
         )
 
-    await db.save_vote(
+    ok = await db.save_vote(
         uid, pid,
         call.from_user.username,
         call.from_user.full_name,
     )
+    if not ok:
+        try:
+            await call.message.edit_reply_markup(reply_markup=None)
+        except Exception:
+            pass
+        return await call.answer(
+            "Этот участник больше не существует — голос не принят.",
+            show_alert=True,
+        )
     p = await db.get_participant(pid)
-    name = p[1] if p else "?"
+    name = esc(p[1]) if p else "?"
 
     try:
         await call.message.edit_reply_markup(reply_markup=None)
@@ -160,14 +179,30 @@ async def cb_show_photos(call: CallbackQuery):
     if not p:
         return await call.answer("Участник не найден", show_alert=True)
 
-    from bot.Utils.helpers import photos_of
     photos = photos_of(p)
-
     if len(photos) < 2:
         return await call.answer("У этого участника одно фото")
 
-    media = [InputMediaPhoto(media=fid) for fid in photos]
-    await call.message.answer_media_group(media)
+    # Telegram: не больше 10 медиа в одном альбоме
+    for start in range(0, len(photos), 10):
+        chunk = photos[start:start + 10]
+        if len(chunk) == 1:
+            # В альбоме должен быть минимум 2 файла — одиночное отправляем как фото
+            try:
+                await call.message.answer_photo(chunk[0])
+            except Exception:
+                pass
+        else:
+            media = [InputMediaPhoto(media=fid) for fid in chunk]
+            try:
+                await call.message.answer_media_group(media)
+            except Exception:
+                # по одному, если альбом не прошёл
+                for fid in chunk:
+                    try:
+                        await call.message.answer_photo(fid)
+                    except Exception:
+                        pass
     await call.answer()
 
 

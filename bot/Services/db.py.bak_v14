@@ -1,0 +1,485 @@
+import json
+import random
+import aiosqlite
+from bot.config import DB_PATH
+
+
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS participants("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "name TEXT NOT NULL,"
+            "photo_id TEXT NOT NULL,"
+            "photo_ids TEXT,"
+            "sort_order INTEGER)"
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS votes("
+            "user_id INTEGER PRIMARY KEY,"
+            "participant_id INTEGER NOT NULL,"
+            "voted_at TEXT DEFAULT CURRENT_TIMESTAMP,"
+            "username TEXT,"
+            "full_name TEXT)"
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS settings("
+            "key TEXT PRIMARY KEY, value TEXT)"
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS admins("
+            "user_id INTEGER PRIMARY KEY,"
+            "username TEXT,"
+            "full_name TEXT,"
+            "added_by INTEGER,"
+            "is_super INTEGER DEFAULT 0,"
+            "added_at TEXT DEFAULT CURRENT_TIMESTAMP)"
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS known_users("
+            "user_id INTEGER PRIMARY KEY,"
+            "username TEXT,"
+            "full_name TEXT,"
+            "last_seen TEXT DEFAULT CURRENT_TIMESTAMP)"
+        )
+        await db.execute(
+            "CREATE INDEX IF NOT EXISTS idx_known_users_uname "
+            "ON known_users(LOWER(username))"
+        )
+        await db.execute(
+            "CREATE TABLE IF NOT EXISTS audit_log("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT,"
+            "ts TEXT DEFAULT CURRENT_TIMESTAMP,"
+            "actor_id INTEGER,"
+            "actor_username TEXT,"
+            "action TEXT NOT NULL,"
+            "target_id INTEGER,"
+            "target_label TEXT,"
+            "details TEXT)"
+        )
+        await db.execute(
+            "INSERT OR IGNORE INTO settings(key,value) VALUES('voting_open','0')"
+        )
+
+        # миграции votes
+        async with db.execute("PRAGMA table_info(votes)") as cur:
+            vcols = [r[1] for r in await cur.fetchall()]
+        if "username" not in vcols:
+            await db.execute("ALTER TABLE votes ADD COLUMN username TEXT")
+        if "full_name" not in vcols:
+            await db.execute("ALTER TABLE votes ADD COLUMN full_name TEXT")
+
+        # миграции participants
+        async with db.execute("PRAGMA table_info(participants)") as cur:
+            pcols = [r[1] for r in await cur.fetchall()]
+        if "photo_ids" not in pcols:
+            await db.execute("ALTER TABLE participants ADD COLUMN photo_ids TEXT")
+        if "sort_order" not in pcols:
+            await db.execute("ALTER TABLE participants ADD COLUMN sort_order INTEGER")
+        await db.execute(
+            "UPDATE participants SET sort_order = id WHERE sort_order IS NULL"
+        )
+        # заполним photo_ids для старых
+        async with db.execute(
+            "SELECT id, photo_id FROM participants "
+            "WHERE photo_ids IS NULL OR photo_ids=''"
+        ) as cur:
+            olds = await cur.fetchall()
+        for pid, photo in olds:
+            await db.execute(
+                "UPDATE participants SET photo_ids=? WHERE id=?",
+                (json.dumps([photo]), pid),
+            )
+
+        # миграции admins
+        async with db.execute("PRAGMA table_info(admins)") as cur:
+            acols = [r[1] for r in await cur.fetchall()]
+        if "is_super" not in acols:
+            await db.execute(
+                "ALTER TABLE admins ADD COLUMN is_super INTEGER DEFAULT 0"
+            )
+
+        await db.commit()
+
+
+# ---------- participants ----------
+async def get_participants():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, name, photo_id, photo_ids FROM participants "
+            "ORDER BY COALESCE(sort_order, id), id"
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def get_participant(pid: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, name, photo_id, photo_ids "
+            "FROM participants WHERE id=?", (pid,)
+        ) as cur:
+            return await cur.fetchone()
+
+
+async def add_participant(name: str, photos) -> int:
+    if isinstance(photos, str):
+        photos = [photos]
+    if not photos:
+        raise ValueError("Нужно хотя бы одно фото")
+    primary = photos[0]
+    photo_ids_json = json.dumps(photos)
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM participants"
+        ) as cur:
+            next_order = (await cur.fetchone())[0]
+        cur = await db.execute(
+            "INSERT INTO participants(name, photo_id, photo_ids, sort_order) "
+            "VALUES(?, ?, ?, ?)",
+            (name, primary, photo_ids_json, next_order),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def delete_participant(pid: int) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id FROM participants WHERE id=?", (pid,)
+        ) as cur:
+            if not await cur.fetchone():
+                return False
+        await db.execute("DELETE FROM votes WHERE participant_id=?", (pid,))
+        await db.execute("DELETE FROM participants WHERE id=?", (pid,))
+        await db.commit()
+        return True
+
+
+async def delete_all_participants() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM participants") as cur:
+            cnt = (await cur.fetchone())[0]
+        await db.execute("DELETE FROM votes")
+        await db.execute("DELETE FROM participants")
+        await db.commit()
+        return cnt
+
+
+async def update_participant_name(pid: int, name: str):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE participants SET name=? WHERE id=?", (name, pid)
+        )
+        await db.commit()
+
+
+async def append_participant_photos(pid: int, new_photos: list):
+    if not new_photos:
+        return
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT photo_ids FROM participants WHERE id=?", (pid,)
+        ) as cur:
+            row = await cur.fetchone()
+        if not row:
+            return
+        existing = []
+        if row[0]:
+            try:
+                existing = json.loads(row[0])
+            except Exception:
+                existing = []
+        existing.extend(new_photos)
+        await db.execute(
+            "UPDATE participants SET photo_ids=? WHERE id=?",
+            (json.dumps(existing), pid),
+        )
+        await db.commit()
+
+
+async def shuffle_participants():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT id FROM participants") as cur:
+            ids = [r[0] for r in await cur.fetchall()]
+        random.shuffle(ids)
+        for order, pid in enumerate(ids, 1):
+            await db.execute(
+                "UPDATE participants SET sort_order=? WHERE id=?", (order, pid)
+            )
+        await db.commit()
+
+
+# ---------- settings ----------
+async def is_open() -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT value FROM settings WHERE key='voting_open'"
+        ) as cur:
+            row = await cur.fetchone()
+            return bool(row and row[0] == "1")
+
+
+async def set_open(value: bool):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES('voting_open',?)",
+            ("1" if value else "0",),
+        )
+        await db.commit()
+
+
+async def get_setting(key, default=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT value FROM settings WHERE key=?", (key,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else default
+
+
+async def set_setting(key, value):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO settings(key,value) VALUES(?,?)",
+            (key, value),
+        )
+        await db.commit()
+
+
+# ---------- votes ----------
+async def get_user_vote(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT participant_id FROM votes WHERE user_id=?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return row[0] if row else None
+
+
+async def save_vote(user_id, participant_id, username=None, full_name=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO votes"
+            "(user_id, participant_id, username, full_name) "
+            "VALUES(?, ?, ?, ?)",
+            (user_id, participant_id, username, full_name),
+        )
+        await db.commit()
+
+
+async def delete_user_vote(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM votes WHERE user_id=?", (user_id,))
+        await db.commit()
+
+
+async def get_results():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT p.id, p.name, COUNT(v.user_id) AS cnt "
+            "FROM participants p "
+            "LEFT JOIN votes v ON p.id = v.participant_id "
+            "GROUP BY p.id "
+            "ORDER BY cnt DESC, p.id"
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def reset_votes():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("DELETE FROM votes")
+        await db.commit()
+
+
+async def get_votes_detailed():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT v.user_id, v.username, v.full_name, p.name, v.voted_at "
+            "FROM votes v "
+            "JOIN participants p ON p.id = v.participant_id "
+            "ORDER BY v.voted_at"
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def get_voter_ids():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT user_id FROM votes") as cur:
+            return [r[0] for r in await cur.fetchall()]
+
+
+async def update_vote_user_info(user_id, username, full_name):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE votes SET username=?, full_name=? "
+            "WHERE user_id=? AND (username IS NULL OR full_name IS NULL)",
+            (username, full_name, user_id),
+        )
+        await db.commit()
+
+
+# ---------- admins ----------
+async def add_admin(user_id, username=None, full_name=None,
+                    added_by=None, is_super=False):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR REPLACE INTO admins"
+            "(user_id, username, full_name, added_by, is_super) "
+            "VALUES(?, ?, ?, ?, ?)",
+            (user_id, username, full_name, added_by, 1 if is_super else 0),
+        )
+        await db.commit()
+
+
+async def delete_admin(user_id) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "DELETE FROM admins WHERE user_id=?", (user_id,)
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def list_admins():
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id, username, full_name, added_at, is_super "
+            "FROM admins ORDER BY is_super DESC, added_at"
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def is_admin(user_id) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM admins WHERE user_id=?", (user_id,)
+        ) as cur:
+            return bool(await cur.fetchone())
+
+
+async def is_admin_by_username(username: str) -> bool:
+    if not username:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT 1 FROM admins WHERE LOWER(username)=LOWER(?)",
+            (username,),
+        ) as cur:
+            return bool(await cur.fetchone())
+
+
+async def is_superadmin(user_id) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT is_super FROM admins WHERE user_id=?", (user_id,)
+        ) as cur:
+            row = await cur.fetchone()
+            return bool(row and row[0] == 1)
+
+
+async def is_superadmin_by_username(username: str) -> bool:
+    if not username:
+        return False
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT is_super FROM admins WHERE LOWER(username)=LOWER(?)",
+            (username,),
+        ) as cur:
+            row = await cur.fetchone()
+            return bool(row and row[0] == 1)
+
+
+async def set_super(user_id, value: bool) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "UPDATE admins SET is_super=? WHERE user_id=?",
+            (1 if value else 0, user_id),
+        )
+        await db.commit()
+        return cur.rowcount > 0
+
+
+async def get_admin_info(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT username, full_name FROM admins WHERE user_id=?",
+            (user_id,),
+        ) as cur:
+            row = await cur.fetchone()
+            return (row[0], row[1]) if row else (None, None)
+
+
+# ---------- known users ----------
+async def upsert_known_user(user_id, username, full_name):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO known_users(user_id, username, full_name, last_seen) "
+            "VALUES(?, ?, ?, CURRENT_TIMESTAMP) "
+            "ON CONFLICT(user_id) DO UPDATE SET "
+            "username=excluded.username, "
+            "full_name=excluded.full_name, "
+            "last_seen=CURRENT_TIMESTAMP",
+            (user_id, username, full_name),
+        )
+        await db.commit()
+
+
+async def find_user_by_username(username: str):
+    if not username:
+        return None
+    username = username.lstrip("@")
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT user_id, username, full_name FROM known_users "
+            "WHERE LOWER(username)=LOWER(?) "
+            "ORDER BY last_seen DESC LIMIT 1",
+            (username,),
+        ) as cur:
+            row = await cur.fetchone()
+            return row if row else None
+
+
+async def count_known_users() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM known_users") as cur:
+            return (await cur.fetchone())[0]
+
+
+# ---------- audit ----------
+async def add_audit(actor_id, actor_username, action,
+                    target_id=None, target_label=None, details=None):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO audit_log"
+            "(actor_id, actor_username, action, target_id, target_label, details) "
+            "VALUES(?, ?, ?, ?, ?, ?)",
+            (actor_id, actor_username, action, target_id, target_label, details),
+        )
+        await db.commit()
+
+
+async def list_audit(limit=20, offset=0):
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT ts, actor_id, actor_username, action, "
+            "target_id, target_label, details "
+            "FROM audit_log ORDER BY id DESC LIMIT ? OFFSET ?",
+            (limit, offset),
+        ) as cur:
+            return await cur.fetchall()
+
+
+async def count_audit() -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute("SELECT COUNT(*) FROM audit_log") as cur:
+            return (await cur.fetchone())[0]
+
+
+async def find_known_user_by_id(user_id: int):
+    """Возвращает (username, full_name) из known_users или None."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT username, full_name FROM known_users WHERE user_id=?",
+            (user_id,),
+        ) as cur:
+            return await cur.fetchone()

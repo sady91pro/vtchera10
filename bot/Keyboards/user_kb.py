@@ -19,4 +19,15 @@ def vote_keyboard(idx: int, total: int, pid: int,
             f"🖼 Все фото ({photos_count})",
             callback_data=f"photos:{pid}",
         ))
+    if total > 1:
+        nums = [
+            InlineKeyboardButton(
+                f"·{i + 1}·" if i == idx else f"{i + 1}",
+                callback_data=f"pg:{i}",
+            )
+            for i in range(total)
+        ]
+        per_row = 5
+        for start in range(0, len(nums), per_row):
+            kb.row(*nums[start:start + per_row])
     return kb

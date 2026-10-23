@@ -13,3 +13,8 @@ class Broadcast(StatesGroup):
 
 class AddAdmin(StatesGroup):
     user_id = State()
+
+
+class EditParticipant(StatesGroup):
+    name = State()
+    photos = State()

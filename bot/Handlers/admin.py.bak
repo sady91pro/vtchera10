@@ -11,7 +11,7 @@ from aiogram.types import (
 )
 
 from bot.Services import db
-from bot.State.states import AddParticipant, Broadcast, AddAdmin
+from bot.State.states import (AddParticipant, Broadcast, AddAdmin, EditParticipant)
 from bot.Keyboards.admin_kb import admin_menu
 from bot.Middleware.admin_filter import IsAdmin, IsSuperAdmin
 from bot.Utils.helpers import send_results
@@ -64,26 +64,113 @@ async def cmd_admin(message: Message):
 
 # ------------------ добавление участника ------------------
 
+_albums = {}
+
+
+def _photos_kb(count: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(
+            f"✅ Готово ({count})", callback_data="add:done"
+        ),
+        InlineKeyboardButton("❌ Отмена", callback_data="add:cancel"),
+    ]])
+
+
+async def _flush_album(mg_id: str, bot):
+    await asyncio.sleep(1.5)
+    entry = _albums.pop(mg_id, None)
+    if not entry:
+        return
+    photos = entry["photos"]
+    chat_id = entry["chat_id"]
+    state = entry["state"]
+    data = await state.get_data()
+    existing = data.get("photos", [])
+    existing.extend(photos)
+    await state.update_data(photos=existing)
+    await bot.send_message(
+        chat_id,
+        f"📸 Из альбома добавлено: <b>{len(photos)}</b>.\n"
+        f"Всего фото: <b>{len(existing)}</b>.",
+        reply_markup=_photos_kb(len(existing)),
+    )
+
+
 async def adm_add(call: CallbackQuery, state):
     await AddParticipant.name.set()
+    await state.update_data(photos=[])
     await call.message.answer("Введите имя участника (или /cancel):")
     await call.answer()
 
 
 async def add_name(message: Message, state):
-    await state.update_data(name=message.text.strip())
-    await AddParticipant.photo.set()
-    await message.answer("Теперь отправьте фото участника:")
-
-
-async def add_photo(message: Message, state):
-    data = await state.get_data()
-    await db.add_participant(data["name"], message.photo[-1].file_id)
-    await state.finish()
+    name = (message.text or "").strip()
+    if not name:
+        return await message.answer("Имя не может быть пустым.")
+    await state.update_data(name=name, photos=[])
+    await AddParticipant.photos.set()
     await message.answer(
-        f"✅ Участник «{data['name']}» добавлен.\n"
-        f"Добавить ещё — /admin"
+        f"Имя: «{name}»\n\n"
+        f"Отправьте <b>фото</b> участника.\n"
+        f"Можно несколько — по одному или альбомом.\n"
+        f"Когда закончите — нажмите ✅ Готово.",
+        reply_markup=_photos_kb(0),
     )
+
+
+async def add_photo_step(message: Message, state):
+    fid = message.photo[-1].file_id
+    mg = message.media_group_id
+
+    if mg:
+        if mg not in _albums:
+            _albums[mg] = {
+                "photos": [],
+                "chat_id": message.chat.id,
+                "state": state,
+            }
+            asyncio.create_task(_flush_album(mg, message.bot))
+        _albums[mg]["photos"].append(fid)
+        return
+
+    data = await state.get_data()
+    photos = data.get("photos", [])
+    photos.append(fid)
+    await state.update_data(photos=photos)
+    await message.answer(
+        f"📸 Фото добавлено. Всего: <b>{len(photos)}</b>.",
+        reply_markup=_photos_kb(len(photos)),
+    )
+
+
+async def add_photos_done(call: CallbackQuery, state):
+    data = await state.get_data()
+    photos = data.get("photos", [])
+    if not photos:
+        return await call.answer(
+            "Сначала отправьте хотя бы одно фото", show_alert=True
+        )
+    name = data.get("name", "?")
+    await db.add_participant(name, photos)
+    await state.finish()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await call.message.answer(
+        f"✅ Участник «{name}» добавлен с <b>{len(photos)}</b> фото."
+    )
+    await call.answer(f"Добавлен: {name}")
+
+
+async def add_photos_cancel(call: CallbackQuery, state):
+    await state.finish()
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await call.message.answer("❌ Добавление отменено.")
+    await call.answer()
 
 
 async def add_photo_wrong(message: Message):
@@ -99,13 +186,17 @@ async def cmd_cancel(message: Message, state):
 
 async def adm_open(call: CallbackQuery):
     await db.set_open(True)
+    await _audit(call.from_user, "vote_open")
     await call.message.answer("🟢 Голосование открыто. Пользователи могут /vote")
     await call.answer()
 
 
 async def adm_close(call: CallbackQuery):
     await db.set_open(False)
+    await _audit(call.from_user, "vote_close")
     await call.message.answer("🔴 Голосование закрыто.")
+    if await db.get_setting("announce_on_close") == "1":
+        await _do_announce(call.bot, actor=call.from_user)
     await call.answer()
 
 
@@ -117,10 +208,16 @@ async def adm_list(call: CallbackQuery):
         )
 
     kb = InlineKeyboardMarkup(row_width=1)
-    for pid, name, _ in parts:
-        kb.add(InlineKeyboardButton(
-            f"🗑 {name}", callback_data=f"adm:del:{pid}"
-        ))
+    for row in parts:
+        pid, name = row[0], row[1]
+        kb.row(
+            InlineKeyboardButton(
+                f"✏️ {name}", callback_data=f"adm:edit:{pid}"
+            ),
+            InlineKeyboardButton(
+                f"🗑 {name}", callback_data=f"adm:del:{pid}"
+            ),
+        )
     kb.add(InlineKeyboardButton(
         "❌ УДАЛИТЬ ВСЕХ", callback_data="adm:delall"
     ))
@@ -146,6 +243,8 @@ async def adm_del(call: CallbackQuery):
 
     name = p[1]
     await db.delete_participant(pid)
+    await _audit(call.from_user, "participant_del",
+                 target_id=pid, target_label=name)
 
     try:
         await call.message.edit_reply_markup(reply_markup=None)
@@ -181,6 +280,7 @@ async def adm_delall(call: CallbackQuery):
 
 async def adm_delall_yes(call: CallbackQuery):
     cnt = await db.delete_all_participants()
+    await _audit(call.from_user, "participant_delall", details=f"count={cnt}")
     try:
         await call.message.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -208,6 +308,7 @@ async def adm_results(call: CallbackQuery):
 
 async def adm_reset(call: CallbackQuery):
     await db.reset_votes()
+    await _audit(call.from_user, "vote_reset")
     await call.message.answer("🗑 Все голоса сброшены.")
     await call.answer()
 
@@ -256,16 +357,18 @@ async def cmd_unvote(message: Message, command):
 
     prev_pid = await db.get_user_vote(uid)
     if not prev_pid:
+        label = await _user_label(message.bot, uid)
         return await message.answer(
-            f"У пользователя <code>{uid}</code> нет голоса."
+            f"У пользователя {label} нет голоса."
         )
 
     p = await db.get_participant(prev_pid)
     pname = p[1] if p else "?"
 
+    label = await _user_label(message.bot, uid)
     await db.delete_user_vote(uid)
     await message.answer(
-        f"✅ Голос пользователя <code>{uid}</code> "
+        f"✅ Голос пользователя {label} "
         f"(за «{pname}») снят.\n"
         f"Он может голосовать заново через /vote."
     )
@@ -482,6 +585,54 @@ async def cmd_delparticipant(message: Message, command):
     )
 
 
+async def _user_label(bot, uid, username=None, full_name=None) -> str:
+    """'@username (<code>123</code>)' или 'Имя (<code>123</code>)' или '<code>123</code>'."""
+    if not username:
+        uname, fname = await db.get_admin_info(uid)
+        username = username or uname
+        full_name = full_name or fname
+    if not username:
+        try:
+            chat = await bot.get_chat(uid)
+            username = chat.username
+            if not full_name:
+                full_name = chat.full_name
+        except Exception:
+            pass
+    parts = []
+    if username:
+        parts.append(f"@{username}")
+    elif full_name:
+        parts.append(full_name)
+    parts.append(f"<code>{uid}</code>")
+    return " ".join(parts)
+
+
+async def _resolve_user_input(bot, text: str):
+    """Принимает '@username' или числовой ID.
+    Возвращает (uid, username, full_name) или None."""
+    text = (text or "").strip()
+    if not text:
+        return None
+    if text.startswith("@"):
+        uname = text[1:].lstrip("@")
+        if not uname:
+            return None
+        try:
+            chat = await bot.get_chat(f"@{uname}")
+            return (chat.id, chat.username or uname, chat.full_name or "")
+        except Exception:
+            return None
+    if text.isdigit():
+        uid = int(text)
+        try:
+            chat = await bot.get_chat(uid)
+            return (uid, chat.username, chat.full_name or "")
+        except Exception:
+            return (uid, None, None)
+    return None
+
+
 async def _add_admin_by_id(bot, uid: int, added_by: int):
     """Возвращает (ok: bool, message: str)."""
     if uid in SUPERADMIN_IDS:
@@ -500,31 +651,69 @@ async def _add_admin_by_id(bot, uid: int, added_by: int):
         pass
 
     await db.add_admin(uid, uname, fname, added_by=added_by)
-    disp = f"@{uname}" if uname else (fname or "")
-    suffix = f" ({disp})" if disp else ""
-    return True, f"✅ Пользователь <code>{uid}</code>{suffix} теперь админ."
+    await _audit(type("U", (), {"id": added_by, "username": None})(),
+                 "admin_add", target_id=uid, target_label=uname)
+    label = await _user_label(bot, uid, uname, fname)
+    return True, f"✅ Пользователь {label} теперь админ."
 
 
 async def cmd_admins(message: Message):
-    lines = ["👥 <b>Управление админами</b>\n", "<b>Суперадмины (.env, нельзя удалить):</b>"]
-    for uid in (SUPERADMIN_IDS or ADMIN_IDS):
-        lines.append(f"• <code>{uid}</code> 🔒")
-
+    env_supers = list(dict.fromkeys(SUPERADMIN_IDS + ADMIN_IDS))
     rows = await db.list_admins()
-    if rows:
-        lines.append("\n<b>Админы (добавлены через бота):</b>")
-        for uid, uname, fname, _ in rows:
+
+    db_supers = [r for r in rows if r[4] == 1]
+    db_admins = [r for r in rows if r[4] != 1]
+
+    lines = ["👥 <b>Управление админами</b>\n"]
+
+    lines.append("🛡 <b>Суперадмины (.env, защищены):</b>")
+    if env_supers:
+        for uid in env_supers:
+            label = await _user_label(message.bot, uid)
+            lines.append(f"• {label} 🔒")
+    else:
+        lines.append("<i>—</i>")
+
+    if db_supers:
+        lines.append("\n⭐ <b>Суперадмины (через бота):</b>")
+        for uid, uname, fname, _, _ in db_supers:
             disp = f"@{uname}" if uname else (fname or "")
             label = f"{disp} (<code>{uid}</code>)" if disp else f"<code>{uid}</code>"
-            lines.append(f"• {label}")
-    else:
-        lines.append("\n<i>Пока нет админов, добавленных через бота.</i>")
+            lines.append(f"• ⭐ {label}")
+
+    if db_admins:
+        lines.append("\n👤 <b>Обычные админы (через бота):</b>")
+        for uid, uname, fname, _, _ in db_admins:
+            disp = f"@{uname}" if uname else (fname or "")
+            label = f"{disp} (<code>{uid}</code>)" if disp else f"<code>{uid}</code>"
+            lines.append(f"• 👤 {label}")
+
+    if not rows:
+        lines.append("\n<i>Админов, добавленных через бота, пока нет.</i>")
 
     kb = InlineKeyboardMarkup(row_width=1)
     kb.add(InlineKeyboardButton("➕ Добавить админа", callback_data="adm:adm_add"))
-    for uid, uname, fname, _ in rows:
-        label = f"🗑 {('@' + uname) if uname else (fname or str(uid))}"
-        kb.add(InlineKeyboardButton(label, callback_data=f"adm:adm_del:{uid}"))
+
+    for uid, uname, fname, _, is_super in rows:
+        name = f"@{uname}" if uname else (fname or str(uid))
+        if is_super == 1:
+            kb.row(
+                InlineKeyboardButton(
+                    f"⬇️ Понизить {name}", callback_data=f"adm:adm_demote:{uid}"
+                ),
+                InlineKeyboardButton(
+                    f"🗑 {name}", callback_data=f"adm:adm_del:{uid}"
+                ),
+            )
+        else:
+            kb.row(
+                InlineKeyboardButton(
+                    f"⭐ В суперадмины {name}", callback_data=f"adm:adm_promote:{uid}"
+                ),
+                InlineKeyboardButton(
+                    f"🗑 {name}", callback_data=f"adm:adm_del:{uid}"
+                ),
+            )
 
     await message.answer("\n".join(lines), reply_markup=kb)
 
@@ -537,8 +726,9 @@ async def adm_admins_menu(call: CallbackQuery):
 async def adm_adm_add_cb(call: CallbackQuery, state):
     await AddAdmin.user_id.set()
     await call.message.answer(
-        "Отправьте <b>user_id</b> нового админа (только цифры).\n"
-        "Пользователь может узнать свой ID через /myid или @userinfobot.\n\n"
+        "Отправьте <b>user_id</b> или <b>@username</b> нового админа.\n"
+        "• ID: <code>123456789</code> — через /myid или @userinfobot\n"
+        "• @username: работает, если пользователь уже нажимал /start у бота\n\n"
         "Отмена: /cancel"
     )
     await call.answer()
@@ -546,13 +736,20 @@ async def adm_adm_add_cb(call: CallbackQuery, state):
 
 async def add_admin_input(message: Message, state):
     text = (message.text or "").strip()
-    if not text.isdigit():
+    resolved = await _resolve_user_input(message.bot, text)
+    if not resolved:
         return await message.answer(
-            "Нужно целое число. Попробуйте снова или /cancel."
+            "Не распознано.\n"
+            "Отправьте числовой ID или @username.\n"
+            "Если @username не находится — попросите пользователя "
+            "нажать /start у бота, затем повторите.\n\n"
+            "Отмена: /cancel"
         )
-    uid = int(text)
+    uid, uname, fname = resolved
     await state.finish()
-    ok, msg = await _add_admin_by_id(message.bot, uid, message.from_user.id)
+    ok, msg = await _add_admin_by_id(
+        message.bot, uid, message.from_user.id
+    )
     await message.answer(msg)
 
 
@@ -569,6 +766,7 @@ async def adm_adm_del_cb(call: CallbackQuery):
         return await call.answer("Этот пользователь не админ", show_alert=True)
 
     await db.delete_admin(uid)
+    await _audit(call.from_user, "admin_del", target_id=uid)
     try:
         await call.message.edit_reply_markup(reply_markup=None)
     except Exception:
@@ -580,33 +778,456 @@ async def adm_adm_del_cb(call: CallbackQuery):
     await call.answer("Удалён")
 
 
+async def _promote_admin(call: CallbackQuery):
+    try:
+        uid = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        return await call.answer()
+    if uid in SUPERADMIN_IDS or uid in ADMIN_IDS:
+        return await call.answer("Уже суперадмин (.env)", show_alert=True)
+    if not await db.is_admin(uid):
+        return await call.answer("Этот пользователь не админ", show_alert=True)
+    if await db.is_superadmin(uid):
+        return await call.answer("Уже суперадмин", show_alert=True)
+
+    label = await _user_label(call.bot, uid)
+    await db.set_super(uid, True)
+    await _audit(call.from_user, "admin_promote", target_id=uid)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await call.message.answer(
+        f"⭐ {label} теперь <b>суперадмин</b>.\n"
+        f"Может назначать других суперадминов."
+    )
+    await call.answer("Повышен")
+
+
+async def _demote_admin(call: CallbackQuery):
+    try:
+        uid = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        return await call.answer()
+    if uid in SUPERADMIN_IDS or uid in ADMIN_IDS:
+        return await call.answer(
+            "Суперадмина из .env понизить нельзя", show_alert=True
+        )
+    if uid == call.from_user.id:
+        return await call.answer(
+            "Нельзя понизить самого себя", show_alert=True
+        )
+    if not await db.is_admin(uid) or not await db.is_superadmin(uid):
+        return await call.answer("Этот пользователь не суперадмин", show_alert=True)
+
+    label = await _user_label(call.bot, uid)
+    await db.set_super(uid, False)
+    await _audit(call.from_user, "admin_demote", target_id=uid)
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await call.message.answer(
+        f"⬇️ {label} понижен до <b>обычного админа</b>.\n"
+        f"Больше не может управлять админами."
+    )
+    await call.answer("Понижен")
+
+
+async def cmd_promote(message: Message, command):
+    args = (command.args or "").strip()
+    if not args:
+        return await message.answer(
+            "Использование: <code>/promote 123456789</code> "
+            "или <code>/promote @username</code>"
+        )
+    resolved = await _resolve_user_input(message.bot, args)
+    if not resolved:
+        return await message.answer("Не удалось найти пользователя.")
+    uid = resolved[0]
+    if uid in SUPERADMIN_IDS or uid in ADMIN_IDS:
+        return await message.answer("Уже суперадмин (.env).")
+    if not await db.is_admin(uid):
+        return await message.answer(
+            f"Пользователь <code>{uid}</code> не админ. "
+            f"Сначала /addadmin {uid}"
+        )
+    if await db.is_superadmin(uid):
+        return await message.answer("Уже суперадмин.")
+    label = await _user_label(message.bot, uid)
+    await db.set_super(uid, True)
+    await message.answer(
+        f"⭐ {label} теперь суперадмин."
+    )
+
+
+async def cmd_demote(message: Message, command):
+    args = (command.args or "").strip()
+    if not args:
+        return await message.answer(
+            "Использование: <code>/demote 123456789</code> "
+            "или <code>/demote @username</code>"
+        )
+    resolved = await _resolve_user_input(message.bot, args)
+    if not resolved:
+        return await message.answer("Не удалось найти пользователя.")
+    uid = resolved[0]
+    if uid in SUPERADMIN_IDS or uid in ADMIN_IDS:
+        return await message.answer("Суперадмина из .env понизить нельзя.")
+    if uid == message.from_user.id:
+        return await message.answer("Нельзя понизить самого себя.")
+    if not await db.is_admin(uid) or not await db.is_superadmin(uid):
+        label = await _user_label(message.bot, uid)
+        return await message.answer(
+            f"Пользователь {label} не суперадмин."
+        )
+    label = await _user_label(message.bot, uid)
+    await db.set_super(uid, False)
+    await message.answer(
+        f"⬇️ {label} понижен до обычного админа."
+    )
+
+
 async def cmd_addadmin(message: Message, command):
     args = (command.args or "").strip()
-    if not args.isdigit():
+    if not args:
         return await message.answer(
-            "Использование: <code>/addadmin 123456789</code>"
+            "Использование: <code>/addadmin 123456789</code> "
+            "или <code>/addadmin @username</code>"
         )
+    resolved = await _resolve_user_input(message.bot, args)
+    if not resolved:
+        return await message.answer(
+            "Не удалось найти пользователя.\n"
+            "Если это @username — пользователь должен сначала "
+            "нажать /start у бота. Либо используйте числовой ID."
+        )
+    uid, uname, fname = resolved
     ok, msg = await _add_admin_by_id(
-        message.bot, int(args), message.from_user.id
+        message.bot, uid, message.from_user.id
     )
     await message.answer(msg)
 
 
 async def cmd_deladmin(message: Message, command):
     args = (command.args or "").strip()
-    if not args.isdigit():
+    if not args:
         return await message.answer(
-            "Использование: <code>/deladmin 123456789</code>"
+            "Использование: <code>/deladmin 123456789</code> "
+            "или <code>/deladmin @username</code>"
         )
-    uid = int(args)
+    resolved = await _resolve_user_input(message.bot, args)
+    if not resolved:
+        return await message.answer("Не удалось найти пользователя.")
+    uid = resolved[0]
     if uid in SUPERADMIN_IDS or uid in ADMIN_IDS:
         return await message.answer("Суперадмина удалить нельзя.")
     if uid == message.from_user.id:
         return await message.answer("Нельзя удалить самого себя.")
     if not await db.is_admin(uid):
-        return await message.answer(f"Пользователь <code>{uid}</code> не админ.")
+        label = await _user_label(message.bot, uid)
+        return await message.answer(f"Пользователь {label} не админ.")
+    label = await _user_label(message.bot, uid)
     await db.delete_admin(uid)
-    await message.answer(f"🗑 Админ <code>{uid}</code> удалён.")
+    await message.answer(f"🗑 Админ {label} удалён.")
+
+
+# ===== аудит =====
+ACTION_LABELS = {
+    "vote_open": "🟢 Открыл(а) голосование",
+    "vote_close": "🔴 Закрыл(а) голосование",
+    "vote_reset": "🗑 Сбросил(а) голоса",
+    "participant_add": "➕ Добавил(а) участника",
+    "participant_del": "🗑 Удалил(а) участника",
+    "participant_delall": "❌ Удалил(а) ВСЕХ участников",
+    "participant_edit": "✏️ Изменил(а) участника",
+    "admin_add": "👤 Добавил(а) админа",
+    "admin_del": "🗑 Удалил(а) админа",
+    "admin_promote": "⭐ Повысил(а) до суперадмина",
+    "admin_demote": "⬇️ Понизил(а) до админа",
+    "shuffle": "🔀 Перемешал(а) порядок",
+    "backup": "💾 Скачал(а) бэкап",
+    "broadcast": "📢 Сделал(а) рассылку",
+    "announce": "🎉 Объявил(а) победителей",
+    "schedule_set": "⏰ Установил(а) расписание",
+}
+
+
+async def _audit(user, action, target_id=None, target_label=None, details=None):
+    try:
+        await db.add_audit(
+            actor_id=user.id,
+            actor_username=user.username,
+            action=action,
+            target_id=target_id,
+            target_label=target_label,
+            details=details,
+        )
+    except Exception:
+        pass
+
+
+# ===== расписание =====
+async def cmd_schedule_open(message: Message, command):
+    args = (command.args or "").strip()
+    try:
+        dt = datetime.strptime(args, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return await message.answer(
+            "Формат: <code>/schedule_open 2026-10-31 20:00</code>\n"
+            "Время — по часовому поясу сервера."
+        )
+    await db.set_setting("schedule_open_at", dt.isoformat())
+    await _audit(message.from_user, "schedule_set",
+                 details=f"open_at={dt.isoformat()}")
+    await message.answer(
+        f"⏰ Автооткрытие: <code>{dt.strftime('%Y-%m-%d %H:%M')}</code>\n"
+        f"Голосование откроется автоматически."
+    )
+
+
+async def cmd_schedule_close(message: Message, command):
+    args = (command.args or "").strip()
+    try:
+        dt = datetime.strptime(args, "%Y-%m-%d %H:%M")
+    except ValueError:
+        return await message.answer(
+            "Формат: <code>/schedule_close 2026-10-31 23:00</code>"
+        )
+    await db.set_setting("schedule_close_at", dt.isoformat())
+    await _audit(message.from_user, "schedule_set",
+                 details=f"close_at={dt.isoformat()}")
+    await message.answer(
+        f"⏰ Автозакрытие: <code>{dt.strftime('%Y-%m-%d %H:%M')}</code>"
+    )
+
+
+async def cmd_unschedule(message: Message):
+    await db.set_setting("schedule_open_at", "")
+    await db.set_setting("schedule_close_at", "")
+    await message.answer("⏰ Расписание очищено.")
+
+
+# ===== backup =====
+async def cmd_backup(message: Message):
+    from bot.config import DB_PATH
+    await _audit(message.from_user, "backup")
+    await message.answer_document(
+        InputFile(DB_PATH, filename=f"votes_backup.db"),
+        caption="💾 Бэкап базы данных",
+    )
+
+
+# ===== shuffle =====
+async def adm_shuffle_cb(call: CallbackQuery):
+    await db.shuffle_participants()
+    await _audit(call.from_user, "shuffle")
+    await call.message.answer("🔀 Порядок участников перемешан.")
+    await call.answer("Перемешано")
+
+
+# ===== audit =====
+async def _render_audit(limit=20, offset=0):
+    total = await db.count_audit()
+    if total == 0:
+        return ("📜 <b>Аудит-лог пуст</b>", None)
+    rows = await db.list_audit(limit=limit, offset=offset)
+    page = offset // limit + 1
+    pages = (total + limit - 1) // limit
+    lines = [f"📜 <b>Аудит-лог</b> (стр {page}/{pages}, всего {total})\n"]
+    for ts, aid, auname, act, tid, tlabel, details in rows:
+        who = f"@{auname}" if auname else str(aid)
+        label = ACTION_LABELS.get(act, act)
+        extra = ""
+        if tlabel:
+            extra = f" «{tlabel}»"
+        elif tid:
+            extra = f" <code>{tid}</code>"
+        if details and not tlabel:
+            extra += f" — <i>{details[:80]}</i>"
+        lines.append(f"• <code>{ts}</code> {who}\n  {label}{extra}")
+    text = "\n".join(lines)
+    kb = None
+    if pages > 1:
+        nav = []
+        if offset > 0:
+            nav.append(InlineKeyboardButton("⬅️", callback_data=f"audit:page:{page - 2}"))
+        nav.append(InlineKeyboardButton(f"{page}/{pages}", callback_data="audit:noop"))
+        if offset + limit < total:
+            nav.append(InlineKeyboardButton("➡️", callback_data=f"audit:page:{page}"))
+        if nav:
+            kb = InlineKeyboardMarkup(inline_keyboard=[nav])
+    return (text, kb)
+
+
+async def cmd_audit(message: Message):
+    text, kb = await _render_audit()
+    if len(text) > 4000:
+        for i in range(0, len(text), 4000):
+            await message.answer(text[i:i + 4000])
+    else:
+        await message.answer(text, reply_markup=kb)
+
+
+async def adm_audit_cb(call: CallbackQuery):
+    await cmd_audit(call.message)
+    await call.answer()
+
+
+async def cb_audit_page(call: CallbackQuery):
+    try:
+        page = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        return await call.answer()
+    text, kb = await _render_audit(limit=20, offset=page * 20)
+    try:
+        await call.message.edit_text(text, reply_markup=kb)
+    except Exception:
+        await call.message.answer(text, reply_markup=kb)
+    await call.answer()
+
+
+# ===== announce =====
+async def _do_announce(bot, actor=None):
+    rows = await db.get_results()
+    if not rows:
+        return 0
+    total = sum(r[2] for r in rows)
+    if total == 0:
+        return 0
+    medals = ["🥇", "🥈", "🥉"]
+    top = rows[:3]
+    lines = ["🎉 <b>Победители конкурса костюмов!</b>\n"]
+    for i, (_, name, cnt) in enumerate(top):
+        pct = cnt * 100 // total if total else 0
+        medal = medals[i] if i < 3 else f"{i + 1}."
+        lines.append(f"{medal} <b>{name}</b> — {cnt} ({pct}%)")
+    lines.append(f"\nВсего голосов: <b>{total}</b>")
+    lines.append("\nСпасибо всем, кто голосовал! 🙌")
+    text = "\n".join(lines)
+
+    voter_ids = await db.get_voter_ids()
+    sent = 0
+    for uid in voter_ids:
+        try:
+            await bot.send_message(uid, text)
+            sent += 1
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)
+
+    if actor:
+        await _audit(actor, "announce",
+                     details=f"sent={sent}/{len(voter_ids)}")
+    return sent
+
+
+async def adm_announce_cb(call: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton("🎉 Объявить всем", callback_data="adm:announce:yes"),
+        InlineKeyboardButton("❌ Отмена", callback_data="adm:announce:no"),
+    ]])
+    await call.message.answer(
+        "🎉 Разослать объявление победителей всем, кто голосовал?",
+        reply_markup=kb,
+    )
+    await call.answer()
+
+
+async def adm_announce_yes(call: CallbackQuery):
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await call.answer("Рассылка...")
+    sent = await _do_announce(call.bot, actor=call.from_user)
+    await call.message.answer(f"✅ Объявление отправлено: {sent} пользователям.")
+
+
+async def adm_announce_no(call: CallbackQuery):
+    try:
+        await call.message.edit_reply_markup(reply_markup=None)
+    except Exception:
+        pass
+    await call.message.answer("❌ Отменено.")
+    await call.answer()
+
+
+async def cmd_announce(message: Message):
+    sent = await _do_announce(message.bot, actor=message.from_user)
+    await message.answer(f"✅ Объявление отправлено: {sent} пользователям.")
+
+
+async def cmd_toggle_autoclose_announce(message: Message):
+    cur = await db.get_setting("announce_on_close", "0")
+    new = "0" if cur == "1" else "1"
+    await db.set_setting("announce_on_close", new)
+    status = "включено 🎉" if new == "1" else "выключено ❌"
+    await message.answer(f"Авто-объявление при закрытии: {status}")
+
+
+# ===== редактирование участника =====
+async def adm_edit_cb(call: CallbackQuery, state):
+    try:
+        pid = int(call.data.split(":")[2])
+    except (IndexError, ValueError):
+        return await call.answer()
+    p = await db.get_participant(pid)
+    if not p:
+        return await call.answer("Участник не найден", show_alert=True)
+    await state.update_data(edit_pid=pid, edit_name=p[1])
+    await EditParticipant.name.set()
+    await call.message.answer(
+        f"✏️ Редактирование «{p[1]}» (id={pid})\n\n"
+        f"Отправьте <b>новое имя</b> или /skip, чтобы оставить текущее.\n"
+        f"Отмена: /cancel"
+    )
+    await call.answer()
+
+
+async def edit_name_input(message: Message, state):
+    text = (message.text or "").strip()
+    if text and text != "/skip":
+        data = await state.get_data()
+        await db.update_participant_name(data["edit_pid"], text)
+        await state.update_data(edit_name=text)
+        await message.answer(f"✅ Имя изменено на «{text}».")
+    await EditParticipant.photos.set()
+    await message.answer(
+        "📸 Отправьте <b>новые фото</b> (добавятся к текущим).\n"
+        "Когда закончите — /done\n"
+        "Пропустить: /skip"
+    )
+
+
+async def edit_photos_input(message: Message, state):
+    fid = message.photo[-1].file_id
+    data = await state.get_data()
+    pid = data["edit_pid"]
+    await db.append_participant_photos(pid, [fid])
+    await message.answer("📸 Фото добавлено. Отправляйте ещё или /done.")
+
+
+async def edit_photos_wrong(message: Message):
+    await message.answer("Нужно фото, текст или /done.")
+
+
+async def edit_done(message: Message, state):
+    data = await state.get_data()
+    await state.finish()
+    await _audit(message.from_user, "participant_edit",
+                 target_id=data.get("edit_pid"),
+                 target_label=data.get("edit_name"))
+    await message.answer(f"✅ Участник «{data.get('edit_name', '?')}» обновлён.")
+
+
+async def edit_skip_photos(message: Message, state):
+    data = await state.get_data()
+    await state.finish()
+    await _audit(message.from_user, "participant_edit",
+                 target_id=data.get("edit_pid"),
+                 target_label=data.get("edit_name"))
+    await message.answer("✅ Сохранено (фото не добавлены).")
 
 
 def register_handlers(dp: Dispatcher):
@@ -620,10 +1241,19 @@ def register_handlers(dp: Dispatcher):
         add_name, IsAdmin(), state=AddParticipant.name, content_types=["text"]
     )
     dp.register_message_handler(
-        add_photo, IsAdmin(), state=AddParticipant.photo, content_types=["photo"]
+        add_photo_step, IsAdmin(), state=AddParticipant.photos,
+        content_types=["photo"],
     )
     dp.register_message_handler(
-        add_photo_wrong, IsAdmin(), state=AddParticipant.photo
+        add_photo_wrong, IsAdmin(), state=AddParticipant.photos
+    )
+    dp.register_callback_query_handler(
+        add_photos_done, IsAdmin(),
+        lambda c: c.data == "add:done", state=AddParticipant.photos,
+    )
+    dp.register_callback_query_handler(
+        add_photos_cancel, IsAdmin(),
+        lambda c: c.data == "add:cancel", state="*",
     )
 
     dp.register_callback_query_handler(
@@ -659,6 +1289,71 @@ def register_handlers(dp: Dispatcher):
     )
     dp.register_message_handler(
         cmd_delparticipant, IsAdmin(), commands=["delparticipant"], state="*"
+    )
+    dp.register_message_handler(
+        cmd_schedule_open, IsAdmin(), commands=["schedule_open"], state="*"
+    )
+    dp.register_message_handler(
+        cmd_schedule_close, IsAdmin(), commands=["schedule_close"], state="*"
+    )
+    dp.register_message_handler(
+        cmd_unschedule, IsAdmin(), commands=["unschedule"], state="*"
+    )
+    dp.register_message_handler(
+        cmd_backup, IsSuperAdmin(), commands=["backup"], state="*"
+    )
+    dp.register_message_handler(
+        cmd_audit, IsSuperAdmin(), commands=["audit"], state="*"
+    )
+    dp.register_message_handler(
+        cmd_announce, IsAdmin(), commands=["announce"], state="*"
+    )
+    dp.register_message_handler(
+        cmd_toggle_autoclose_announce, IsAdmin(),
+        commands=["announce_on_close"], state="*"
+    )
+    dp.register_callback_query_handler(
+        adm_shuffle_cb, IsAdmin(), lambda c: c.data == "adm:shuffle", state="*"
+    )
+    dp.register_callback_query_handler(
+        adm_audit_cb, IsSuperAdmin(), lambda c: c.data == "adm:audit", state="*"
+    )
+    dp.register_callback_query_handler(
+        cb_audit_page, IsSuperAdmin(),
+        lambda c: c.data and c.data.startswith("audit:page:"), state="*"
+    )
+    dp.register_callback_query_handler(
+        adm_announce_cb, IsAdmin(),
+        lambda c: c.data == "adm:announce", state="*"
+    )
+    dp.register_callback_query_handler(
+        adm_announce_yes, IsAdmin(),
+        lambda c: c.data == "adm:announce:yes", state="*"
+    )
+    dp.register_callback_query_handler(
+        adm_announce_no, IsAdmin(),
+        lambda c: c.data == "adm:announce:no", state="*"
+    )
+    dp.register_callback_query_handler(
+        adm_edit_cb, IsAdmin(),
+        lambda c: c.data and c.data.startswith("adm:edit:"), state="*"
+    )
+    dp.register_message_handler(
+        edit_name_input, IsAdmin(), state=EditParticipant.name,
+        content_types=["text"]
+    )
+    dp.register_message_handler(
+        edit_photos_input, IsAdmin(), state=EditParticipant.photos,
+        content_types=["photo"]
+    )
+    dp.register_message_handler(
+        edit_done, IsAdmin(), commands=["done"], state=EditParticipant.photos
+    )
+    dp.register_message_handler(
+        edit_skip_photos, IsAdmin(), commands=["skip"], state=EditParticipant.photos
+    )
+    dp.register_message_handler(
+        edit_photos_wrong, IsAdmin(), state=EditParticipant.photos
     )
     dp.register_callback_query_handler(
         adm_del, IsAdmin(),
@@ -698,6 +1393,20 @@ def register_handlers(dp: Dispatcher):
     dp.register_callback_query_handler(
         adm_adm_del_cb, IsSuperAdmin(),
         lambda c: c.data and c.data.startswith("adm:adm_del:"), state="*",
+    )
+    dp.register_callback_query_handler(
+        _promote_admin, IsSuperAdmin(),
+        lambda c: c.data and c.data.startswith("adm:adm_promote:"), state="*",
+    )
+    dp.register_callback_query_handler(
+        _demote_admin, IsSuperAdmin(),
+        lambda c: c.data and c.data.startswith("adm:adm_demote:"), state="*",
+    )
+    dp.register_message_handler(
+        cmd_promote, IsSuperAdmin(), commands=["promote"], state="*"
+    )
+    dp.register_message_handler(
+        cmd_demote, IsSuperAdmin(), commands=["demote"], state="*"
     )
     dp.register_message_handler(
         add_admin_input, IsSuperAdmin(),
