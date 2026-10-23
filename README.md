@@ -10,6 +10,6 @@ python -m venv venv
 # 3. Поставил всё из requirements.txt
 pip install -r requirements.txt
 
-# 4. Настроил .env (Отправлю Володе в лс)
+# 4. Настроил .env 
 # 5. Запустил
 python main.py
